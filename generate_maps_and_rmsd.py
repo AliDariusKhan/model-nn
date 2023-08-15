@@ -108,7 +108,7 @@ def get_maps_and_rmsd(pdb_id):
                     yield fwt_phwt_value, delfwt_phdelwt_value, min_distance
 
 def main():
-    with open('./input_pdb_id.txt', 'r') as f:
+    with open('./input_pdb_list.txt', 'r') as f:
         pdb_ids = f.read().splitlines()
 
     for pdb_id in pdb_ids:
