@@ -1,8 +1,13 @@
+import random
 import requests
 import os
 import subprocess
 from Bio import PDB
 import gemmi
+import numpy as np
+import tensorflow as tf
+
+N_GRID = 8
 
 def fetch_mtz(pdb_id, output_dir='mtzs_for_modelcraft'):
     mtz_path = os.path.join(output_dir, f"{pdb_id}.mtz")
@@ -73,7 +78,7 @@ def execute_modelcraft(pdb_id):
     if result.returncode != 0:
         print(f"Failed to execute modelcraft for {pdb_id}: {result.stderr}")
 
-def get_maps_and_rmsd(pdb_id):    
+def get_maps_and_distances(pdb_id, spacing=1.0):    
     mtz = gemmi.read_mtz_file(os.path.join('modelcraft_outputs', pdb_id, 'modelcraft.mtz'))
     grid_fwt_phwt = mtz.transform_f_phi_to_map("FWT", "PHWT")
     grid_delfwt_phdelwt = mtz.transform_f_phi_to_map("DELFWT", "PHDELWT")
@@ -90,8 +95,19 @@ def get_maps_and_rmsd(pdb_id):
         for model_residue in model_chain:
             model_CA = model_residue.find_atom("CA", "\0")
             if model_CA:
-                fwt_phwt_value = grid_fwt_phwt.interpolate_value(model_CA.pos)
-                delfwt_phdelwt_value = grid_delfwt_phdelwt.interpolate_value(model_CA.pos)
+                offset = (N_GRID - 1) * spacing / 2
+                fwt_phwt_values = np.zeros((N_GRID, N_GRID, N_GRID))
+                delfwt_phdelwt_values = np.zeros((N_GRID, N_GRID, N_GRID))
+                
+                for dx in range(N_GRID):
+                    for dy in range(N_GRID):
+                        for dz in range(N_GRID):
+                            x = model_CA.pos.x + spacing * dx - offset
+                            y = model_CA.pos.y + spacing * dy - offset
+                            z = model_CA.pos.z + spacing * dz - offset
+                            pos = gemmi.Position(x, y, z)
+                            fwt_phwt_values[dx, dy, dz] = grid_fwt_phwt.interpolate_value(pos)
+                            delfwt_phdelwt_values[dx, dy, dz] = grid_delfwt_phdelwt.interpolate_value(pos)
 
                 min_distance = float('inf')
                 nearest_ref_CA = None
@@ -105,21 +121,135 @@ def get_maps_and_rmsd(pdb_id):
                                 nearest_ref_CA = ref_CA
 
                 if nearest_ref_CA:
-                    yield fwt_phwt_value, delfwt_phdelwt_value, min_distance
+                    return np.concatenate([fwt_phwt_values.reshape(N_GRID, N_GRID, N_GRID, 1), delfwt_phdelwt_values.reshape(N_GRID, N_GRID, N_GRID, 1)], axis=-1), np.array([min_distance])
 
-def main():
+def create_model():
+    x = inputs = tf.keras.Input(shape=(N_GRID, N_GRID, N_GRID, 2))
+    _downsampling_args = {
+        "padding": "same",
+        "use_bias": False,
+        "kernel_size": 3,
+        "strides": 1,
+    }
+
+    filter_list = [32, 64, 128]
+    for filters in filter_list:
+        x = tf.keras.layers.Conv3D(filters, **_downsampling_args)(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.ReLU()(x)
+        x = tf.keras.layers.MaxPool3D(2)(x)
+
+    x = tf.keras.layers.Flatten()(x)
+    x = tf.keras.layers.Dense(128)(x)
+    x = tf.keras.layers.Dense(64)(x)
+    x = tf.keras.layers.Dense(32)(x)
+    x = tf.keras.layers.Dense(16)(x)
+    x = tf.keras.layers.Dense(8)(x)
+    output = tf.keras.layers.Dense(1)(x)
+    return tf.keras.Model(inputs=inputs, outputs=output)
+
+def train():
+    train_gen = generate_dataset("train")
+    test_gen = generate_dataset("test")
+    input = tf.TensorSpec(shape=(N_GRID, N_GRID, N_GRID, 2), dtype=tf.float32)
+    output = tf.TensorSpec(shape=(1), dtype=tf.float32)
+
+    train_dataset = tf.data.Dataset.from_generator(
+        lambda: train_gen, output_signature=(input, output)
+    )
+    test_dataset = tf.data.Dataset.from_generator(
+        lambda: test_gen, output_signature=(input, output)
+    )
+
+    epochs: int = 100
+    batch_size: int = 8
+    steps_per_epoch: int = 10000
+    validation_steps: int = 1000
+    name: str = "test_1"
+
+    train_dataset = train_dataset.repeat(epochs).batch(batch_size=batch_size)
+    test_dataset = test_dataset.repeat(epochs).batch(batch_size=batch_size)
+
+    model = create_model()
+    model.summary()
+
+    model.compile(optimizer="adam", loss="mse",  metrics=['mse'])
+
+    logger = tf.keras.callbacks.CSVLogger(f"train_{name}.csv", append=True)
+    reduce_lr_on_plat = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.8,
+        patience=5,
+        verbose=1,
+        mode="auto",
+        cooldown=5,
+        min_lr=1e-7,
+    )
+    weight_path: str = f"models/{name}.best.hdf5"
+
+    checkpoint = tf.keras.callbacks.ModelCheckpoint(
+        weight_path,
+        monitor="val_loss",
+        verbose=1,
+        save_best_only=True,
+        mode="min",
+        save_weights_only=False,
+    )
+    
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(
+        log_dir=f"./logs/{name}", histogram_freq=1, profile_batch=(10, 30)
+    )
+    
+    callbacks_list = [
+        checkpoint,
+        # reduce_lr_on_plat,
+        # TqdmCallback(verbose=2),
+        tensorboard_callback,
+    ]
+
+    model.fit(
+        train_dataset,
+        epochs=epochs,
+        steps_per_epoch=steps_per_epoch,
+        validation_data=test_dataset,
+        validation_steps=validation_steps,
+        callbacks=callbacks_list,
+        verbose=1,
+        use_multiprocessing=True,
+    )
+
+def generate_dataset(train_or_test):
+    with open(f'./{train_or_test}_pdb_ids.txt', 'r') as f:
+        pdb_ids = f.read().splitlines()
+    for pdb_id in pdb_ids:
+        yield get_maps_and_distances(pdb_id)
+
+def generate_inputs(train_test_split=0.8):
     with open('./input_pdb_list.txt', 'r') as f:
         pdb_ids = f.read().splitlines()
+    
+    random.shuffle(pdb_ids)
+    num_train = int(len(pdb_ids) * train_test_split)
+    if num_train == 0:
+        num_train = 1
+    elif num_train == len(pdb_ids):
+        num_train = len(pdb_ids) - 1
 
-    for pdb_id in pdb_ids:
-        try:
+    train_ids = pdb_ids[:num_train]
+    test_ids = pdb_ids[num_train:]
+
+    for train_or_test, pdb_ids in [("train", train_ids), ("test", test_ids)]:
+        for pdb_id in pdb_ids:
+            with open(f'{train_or_test}_pdb_ids.txt', 'w') as file:
+                file.write(f"{pdb_id}\n")
             fetch_pdb(pdb_id)
             fetch_mtz(pdb_id)
             generate_contents_json(pdb_id)
             execute_modelcraft(pdb_id)
-            get_maps_and_rmsd(pdb_id)
-        except requests.HTTPError:
-            print(f"Failed to process files for {pdb_id}")
+
+def main():
+    generate_inputs()
+    train()
 
 if __name__ == "__main__":
     main()
