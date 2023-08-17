@@ -173,7 +173,7 @@ def train():
     model = create_model()
     model.summary()
 
-    model.compile(optimizer="adam", loss="mse",  metrics=['mse'])
+    model.compile(optimizer=tf.optimizers.Adam(learning_rate=1e-4), loss="mse",  metrics=['mse'])
 
     logger = tf.keras.callbacks.CSVLogger(f"train_{name}.csv", append=True)
     reduce_lr_on_plat = tf.keras.callbacks.ReduceLROnPlateau(
