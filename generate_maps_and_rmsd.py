@@ -78,50 +78,96 @@ def execute_modelcraft(pdb_id):
     if result.returncode != 0:
         print(f"Failed to execute modelcraft for {pdb_id}: {result.stderr}")
 
-def get_maps_and_distances(pdb_id, spacing=1.0):    
+def align_with_csymmatch(pdb_id):
+    pdb_path = os.path.join('pdb_files', f"{pdb_id}.pdb")
+    modelcraft_pdb_path = os.path.join('modelcraft_outputs', pdb_id, 'modelcraft.cif')
+    aligned_output_dir = "aligned_pdb"
+    aligned_pdb_path = os.path.join(aligned_output_dir, f"{pdb_id}.pdb")
+    
+    os.makedirs(aligned_output_dir, exist_ok=True)
+    
+    cmd = [
+        "csymmatch",
+        "-pdbin-ref", modelcraft_pdb_path,
+        "-pdbin", pdb_path,
+        "-pdbout", aligned_pdb_path
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Failed to align pdb model for {pdb_id} with csymmatch: {result.stderr}")
+
+def get_grid_points(residue, spacing=1.0):
+    CA_pos = residue.find_atom("CA", "\0").pos
+    N_pos = residue.find_atom("N", "\0").pos
+    C_pos = residue.find_atom("C", "\0").pos
+    x = C_pos - CA_pos
+    x = gemmi.Vec3(x.x, x.y, x.z)
+    x_norm = x / x.length()
+    CA_to_N = N_pos - CA_pos
+    z = x.cross(CA_to_N)
+    z_norm = z / z.length()
+    y_norm = x_norm.cross(z_norm)
+    offset = gemmi.Vec3(CA_pos.x, CA_pos.y, CA_pos.z) - ((N_GRID - 1) * spacing / 2) * (x_norm + y_norm + z_norm)
+    grid_points = [[N_GRID * [0] for _ in range(N_GRID)] for _ in range(N_GRID)]
+    for dx in range(N_GRID):
+        for dy in range(N_GRID):
+            for dz in range(N_GRID):
+                vector = offset + spacing * (dx * x_norm + dy * y_norm + dz * z_norm)
+                grid_points[dx][dy][dz] = gemmi.Position(vector.x, vector.y, vector.z)
+    return grid_points
+
+def standard_position(position, unit_cell):
+    return gemmi.Position(
+        position.x % unit_cell.a,
+        position.y % unit_cell.b,
+        position.z % unit_cell.c)
+
+def get_maps_and_distances(pdb_id):
     mtz = gemmi.read_mtz_file(os.path.join('modelcraft_outputs', pdb_id, 'modelcraft.mtz'))
     grid_fwt_phwt = mtz.transform_f_phi_to_map("FWT", "PHWT")
     grid_delfwt_phdelwt = mtz.transform_f_phi_to_map("DELFWT", "PHDELWT")
     grid_fwt_phwt.normalize()
     grid_delfwt_phdelwt.normalize()
 
-    ref_structure_path = os.path.join('pdb_files', f"{pdb_id}.pdb")
-    modelcraft_structure_path = os.path.join('modelcraft_outputs', pdb_id, 'modelcraft.cif')
+    ref_structure_path = os.path.join('aligned_pdb', f"{pdb_id}.pdb")    
+    model_structure_path = os.path.join('modelcraft_outputs', f"{pdb_id}", "modelcraft.cif")
 
     ref_structure = gemmi.read_structure(ref_structure_path)
-    modelcraft_structure = gemmi.read_structure(modelcraft_structure_path)
+    model_structure = gemmi.read_structure(model_structure_path)
 
-    for model_chain in modelcraft_structure[0]:
-        for model_residue in model_chain:
-            model_CA = model_residue.find_atom("CA", "\0")
-            if model_CA:
-                offset = (N_GRID - 1) * spacing / 2
-                fwt_phwt_values = np.zeros((N_GRID, N_GRID, N_GRID))
-                delfwt_phdelwt_values = np.zeros((N_GRID, N_GRID, N_GRID))
-                
-                for dx in range(N_GRID):
-                    for dy in range(N_GRID):
-                        for dz in range(N_GRID):
-                            x = model_CA.pos.x + spacing * dx - offset
-                            y = model_CA.pos.y + spacing * dy - offset
-                            z = model_CA.pos.z + spacing * dz - offset
-                            pos = gemmi.Position(x, y, z)
-                            fwt_phwt_values[dx, dy, dz] = grid_fwt_phwt.interpolate_value(pos)
-                            delfwt_phdelwt_values[dx, dy, dz] = grid_delfwt_phdelwt.interpolate_value(pos)
+    neighbor_search = gemmi.NeighborSearch(ref_structure[0], ref_structure.cell, max_radius=5)
+    for chain_idx, chain in enumerate(ref_structure[0]):
+        for res_idx, res in enumerate(chain):
+            for atom_idx, atom in enumerate(res):
+                if atom.name == 'CA':
+                    neighbor_search.add_atom(atom, chain_idx, res_idx, atom_idx)
 
-                min_distance = float('inf')
-                nearest_ref_CA = None
-                for ref_chain in ref_structure[0]:
-                    for ref_residue in ref_chain:
-                        ref_CA = ref_residue.find_atom("CA", "\0")
-                        if ref_CA:
-                            distance = model_CA.pos.dist(ref_CA.pos)
-                            if distance < min_distance:
-                                min_distance = distance
-                                nearest_ref_CA = ref_CA
+    for chain in model_structure[0]:
+        for residue in chain:
+            if not gemmi.find_tabulated_residue(residue.name).is_amino_acid():
+                continue
+            fwt_phwt_values = np.zeros((N_GRID, N_GRID, N_GRID))
+            delfwt_phdelwt_values = np.zeros((N_GRID, N_GRID, N_GRID))
+            grid_points = get_grid_points(residue)
+            for dx in range(N_GRID):
+                for dy in range(N_GRID):
+                    for dz in range(N_GRID):
+                        pos = grid_points[dx][dy][dz]
+                        fwt_phwt_values[dx, dy, dz] = grid_fwt_phwt.interpolate_value(pos)
+                        delfwt_phdelwt_values[dx, dy, dz] = grid_delfwt_phdelwt.interpolate_value(pos)
 
-                if nearest_ref_CA:
-                    return np.concatenate([fwt_phwt_values.reshape(N_GRID, N_GRID, N_GRID, 1), delfwt_phdelwt_values.reshape(N_GRID, N_GRID, N_GRID, 1)], axis=-1), np.array([min_distance])
+            model_CA = residue.find_atom("CA", "\0")
+            ref_CA = neighbor_search.find_nearest_atom(model_CA.pos, radius=5)
+            if not ref_CA:
+                continue
+            model_CA_pos = standard_position(model_CA.pos, model_structure.cell)
+            ref_CA_pos = standard_position(ref_CA.pos, ref_structure.cell)
+            model_to_ref = model_CA_pos - ref_CA_pos
+
+            return np.concatenate([
+                fwt_phwt_values.reshape(N_GRID, N_GRID, N_GRID, 1), 
+                delfwt_phdelwt_values.reshape(N_GRID, N_GRID, N_GRID, 1)], axis=-1), np.array([model_to_ref.length()])
 
 def create_model():
     x = inputs = tf.keras.Input(shape=(N_GRID, N_GRID, N_GRID, 2))
@@ -246,6 +292,7 @@ def generate_inputs(train_test_split=0.8):
             fetch_mtz(pdb_id)
             generate_contents_json(pdb_id)
             execute_modelcraft(pdb_id)
+            align_with_csymmatch(pdb_id)
 
 def main():
     generate_inputs()
