@@ -97,25 +97,45 @@ def align_with_csymmatch(pdb_id):
     if result.returncode != 0:
         print(f"Failed to align pdb model for {pdb_id} with csymmatch: {result.stderr}")
 
-def get_grid_points(residue, spacing=1.0):
-    CA_pos = residue.find_atom("CA", "\0").pos
-    N_pos = residue.find_atom("N", "\0").pos
-    C_pos = residue.find_atom("C", "\0").pos
-    x = C_pos - CA_pos
-    x = gemmi.Vec3(x.x, x.y, x.z)
-    x_norm = x / x.length()
-    CA_to_N = N_pos - CA_pos
-    z = x.cross(CA_to_N)
-    z_norm = z / z.length()
-    y_norm = x_norm.cross(z_norm)
-    offset = gemmi.Vec3(CA_pos.x, CA_pos.y, CA_pos.z) - ((N_GRID - 1) * spacing / 2) * (x_norm + y_norm + z_norm)
-    grid_points = [[N_GRID * [0] for _ in range(N_GRID)] for _ in range(N_GRID)]
-    for dx in range(N_GRID):
-        for dy in range(N_GRID):
-            for dz in range(N_GRID):
-                vector = offset + spacing * (dx * x_norm + dy * y_norm + dz * z_norm)
-                grid_points[dx][dy][dz] = gemmi.Position(vector.x, vector.y, vector.z)
-    return grid_points
+def gemmi_position_to_np_array(gemmi_pos):
+    return np.array([getattr(gemmi_pos, coord) for coord in ['x', 'y', 'z']])
+
+def get_grid_basis(residue):
+    origin = gemmi_position_to_np_array(residue.find_atom("CA", "\0").pos)
+    plane_point_1 = gemmi_position_to_np_array(residue.find_atom("N", "\0").pos)
+    plane_point_2 = gemmi_position_to_np_array(residue.find_atom("C", "\0").pos)
+    x = plane_point_1 - origin
+    x_norm = x / np.linalg.norm(x)
+    plane_vector = plane_point_2 - origin
+    z = np.cross(x, plane_vector)
+    z_norm = z / np.linalg.norm(z)
+    y_norm = np.cross(x_norm, z_norm)
+    return origin, x_norm, y_norm, z_norm
+
+def get_map_values(residue, grid_fwt_phwt, grid_delfwt_phdelwt, spacing=1.0, populate_individually=False):
+    origin, x, y, z = get_grid_basis(residue)
+    grid_corner = origin - ((N_GRID - 1) * spacing / 2) * (x + y + z)
+
+    fwt_phwt_values = np.zeros((N_GRID, N_GRID, N_GRID), dtype=np.float32)
+    delfwt_phdelwt_values = np.zeros((N_GRID, N_GRID, N_GRID), dtype=np.float32)
+    
+    if populate_individually:
+        for i in range(N_GRID):
+            for j in range(N_GRID):
+                for k in range(N_GRID):
+                    vector = grid_corner + spacing * (i * x + j * y + k * z)
+                    pos = gemmi.Position(*vector)
+                    fwt_phwt_values[i, j, k] = grid_fwt_phwt.interpolate_value(pos)
+                    delfwt_phdelwt_values[i, j, k] = grid_delfwt_phdelwt.interpolate_value(pos)
+    else:
+        transform = gemmi.Transform()
+        transform.mat.fromlist(np.column_stack([x, y, z]))
+        transform.vec.fromlist(grid_corner)
+
+        grid_fwt_phwt.interpolate_values(fwt_phwt_values, transform)
+        grid_delfwt_phdelwt.interpolate_values(delfwt_phdelwt_values, transform)
+
+    return fwt_phwt_values, delfwt_phdelwt_values
 
 def standard_position(position, unit_cell):
     return gemmi.Position(
@@ -123,7 +143,7 @@ def standard_position(position, unit_cell):
         position.y % unit_cell.b,
         position.z % unit_cell.c)
 
-def get_maps_and_distances(pdb_id):
+def get_maps_and_distances(pdb_id, use_transform=True):
     mtz = gemmi.read_mtz_file(os.path.join('modelcraft_outputs', pdb_id, 'modelcraft.mtz'))
     grid_fwt_phwt = mtz.transform_f_phi_to_map("FWT", "PHWT")
     grid_delfwt_phdelwt = mtz.transform_f_phi_to_map("DELFWT", "PHDELWT")
@@ -147,15 +167,8 @@ def get_maps_and_distances(pdb_id):
         for residue in chain:
             if not gemmi.find_tabulated_residue(residue.name).is_amino_acid():
                 continue
-            fwt_phwt_values = np.zeros((N_GRID, N_GRID, N_GRID))
-            delfwt_phdelwt_values = np.zeros((N_GRID, N_GRID, N_GRID))
-            grid_points = get_grid_points(residue)
-            for dx in range(N_GRID):
-                for dy in range(N_GRID):
-                    for dz in range(N_GRID):
-                        pos = grid_points[dx][dy][dz]
-                        fwt_phwt_values[dx, dy, dz] = grid_fwt_phwt.interpolate_value(pos)
-                        delfwt_phdelwt_values[dx, dy, dz] = grid_delfwt_phdelwt.interpolate_value(pos)
+            
+            fwt_phwt_values, delfwt_phdelwt_values = get_map_values(residue, grid_fwt_phwt, grid_delfwt_phdelwt)            
 
             model_CA = residue.find_atom("CA", "\0")
             ref_CA = neighbor_search.find_nearest_atom(model_CA.pos, radius=5)
