@@ -24,7 +24,8 @@ def fetch_mtz(pdb_id, output_dir='mtzs_for_modelcraft'):
             f.write(chunk)
 
 def fetch_pdb(pdb_id, output_dir='pdb_files', if_jarvis=True):
-    # f'/old_vault/pdb/pdb{pdb_id}.ent'
+    if os.path.exists(f'/old_vault/pdb/pdb{pdb_id}.ent'):
+        return
     pdb_path = os.path.join(output_dir, f"{pdb_id}.pdb")
     if os.path.exists(pdb_path):
         print(f"PDB for {pdb_id} already exists. Skipping download.")
@@ -69,7 +70,7 @@ def execute_modelcraft(pdb_id):
         "modelcraft", "xray",
         "--contents", contents_json_path,
         "--data", data_path,
-        # "--overwrite-directory",
+        "--overwrite-directory",
         "--cycles", "1",
         "--directory", directory_path,
         "--phases", "PHIC,FOM"
@@ -79,7 +80,10 @@ def execute_modelcraft(pdb_id):
         print(f"Failed to execute modelcraft for {pdb_id}: {result.stderr}")
 
 def align_with_csymmatch(pdb_id):
-    pdb_path = os.path.join('pdb_files', f"{pdb_id}.pdb")
+    if os.path.exists(f'/old_vault/pdb/pdb{pdb_id}.ent'):
+        pdb_path = f'/old_vault/pdb/pdb{pdb_id}.ent'
+    else:
+        pdb_path = os.path.join('pdb_files', f"{pdb_id}.pdb")
     modelcraft_pdb_path = os.path.join('modelcraft_outputs', pdb_id, 'modelcraft.cif')
     aligned_output_dir = "aligned_pdb"
     aligned_pdb_path = os.path.join(aligned_output_dir, f"{pdb_id}.pdb")
