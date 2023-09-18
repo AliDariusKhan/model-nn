@@ -82,22 +82,16 @@ def execute_modelcraft(pdb_id):
             raise RuntimeError(f"Failed to execute modelcraft for {pdb_id}: Output file '{expected_file}' not created or empty")
 
 def main():
-    with open('successful_mtz_downloads.txt', 'r') as f:
-        pdb_ids = f.read().splitlines()
-    
-    successful_pdb_ids = []
+    mtz_folder_path = 'mtzs_for_modelcraft'
+    mtz_files = [f for f in os.listdir(mtz_folder_path) if f.endswith('.mtz')]
+    pdb_ids = [os.path.splitext(mtz_file)[0] for mtz_file in mtz_files]
 
     for pdb_id in pdb_ids:
         try:
             generate_contents_json(pdb_id)
             execute_modelcraft(pdb_id)
-            successful_pdb_ids.append(pdb_id)
         except:
             print(f"Failed to generate modelcraft for {pdb_id}")
-
-    with open('successful_modelcraft_generations.txt', 'w') as f:
-        for pdb_id in successful_pdb_ids:
-            f.write(f"{pdb_id}\n")
 
 if __name__ == "__main__":
     main()
