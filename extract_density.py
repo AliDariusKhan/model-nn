@@ -55,7 +55,6 @@ def get_tortoize_data(pdb_id, cif_path, pdb_dir="modelcraft_pdb"):
         shell=True,
         stdout=subprocess.PIPE)
     tortoize_output = tortoize_process.communicate()[0]
-    print("tortoize_output here", tortoize_output)
     tortoize_dict = json.loads(tortoize_output)
     residues = tortoize_dict["model"]["1"]["residues"]
 
@@ -94,18 +93,18 @@ def residue_density_map_generator(train_or_test):
             density_map.normalize()
 
         cif_path = os.path.join('modelcraft_outputs', f"{pdb_id}", "modelcraft.cif")
-        tortoize_data = get_tortoize_data(pdb_id, cif_path)
-
         model_structure = gemmi.read_structure(cif_path)
-        reference_structure = get_reference_structure(pdb_id)     
+
+        ref_structure = get_reference_structure(pdb_id)
+        neighbor_search = gemmi.NeighborSearch(ref_structure[0], ref_structure.cell, max_radius=5)
+        for chain_idx, chain in enumerate(ref_structure[0]):
+            for res_idx, res in enumerate(chain):
+                for atom_idx, atom in enumerate(res):
+                    if atom.name == 'CA':
+                        neighbor_search.add_atom(atom, chain_idx, res_idx, atom_idx)
 
         for chain in model_structure[0]:
-            chain_rama_z_data = tortoize_data[chain.name]
             for residue in chain:
-                if residue.seqid.num not in chain_rama_z_data:
-                    continue
-                rama_z_score = chain_rama_z_data[residue.seqid.num]
-                
                 if not gemmi.find_tabulated_residue(residue.name).is_amino_acid():
                     continue
 
@@ -114,7 +113,21 @@ def residue_density_map_generator(train_or_test):
                     map_values = density_map_grid(residue, density_map).reshape(N_GRID, N_GRID, N_GRID, 1)
                     all_map_values.append(map_values)
 
-                yield np.concatenate(all_map_values, axis=-1), np.array([rama_z_score])
+                model_CA = residue.find_atom("CA", "\0")
+                ref_CA = neighbor_search.find_nearest_atom(model_CA.pos, radius=5)
+                if not ref_CA:
+                    continue
+                model_CA_pos = standard_position(model_CA.pos, model_structure.cell)
+                ref_CA_pos = standard_position(ref_CA.pos, ref_structure.cell)
+                model_to_ref = model_CA_pos - ref_CA_pos
+
+                yield np.concatenate(all_map_values, axis=-1), np.array([model_to_ref.length()])
+
+def standard_position(position, unit_cell):
+    return gemmi.Position(
+        position.x % unit_cell.a,
+        position.y % unit_cell.b,
+        position.z % unit_cell.c)
 
 def create_model():
     x = inputs = tf.keras.Input(shape=(N_GRID, N_GRID, N_GRID, 2))
