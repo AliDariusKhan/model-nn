@@ -6,6 +6,7 @@ import subprocess
 import json
 import tensorflow as tf
 import requests
+import math
 
 N_GRID = 32
 MAPS = [("FWT", "PHWT"), ("DELFWT", "PHDELWT")]
@@ -30,6 +31,14 @@ def density_map_grid(residue, density_map, spacing=0.5):
     grid_corner = origin - ((N_GRID - 1) * spacing / 2) * (x + y + z)
 
     density_map_grid_values = np.zeros((N_GRID, N_GRID, N_GRID), dtype=np.float32)
+
+    # ind_values = np.zeros((N_GRID, N_GRID, N_GRID), dtype=np.float32)
+    # for i in range(N_GRID):
+    #     for j in range(N_GRID):
+    #         for k in range(N_GRID):
+    #             vector = grid_corner + spacing * (i * x + j * y + k * z)
+    #             pos = gemmi.Position(*vector)
+    #             ind_values[i, j, k] = density_map.interpolate_value(pos)
     
     transform = gemmi.Transform()
     transform.mat.fromlist(spacing * np.column_stack([x, y, z]))
@@ -39,7 +48,7 @@ def density_map_grid(residue, density_map, spacing=0.5):
     return density_map_grid_values
 
 def pdb_id_generator(train_or_test):
-    with open(f'./{train_or_test}_pdb_ids.txt', 'r') as f:
+    with open(f'./{train_or_test}_pdb_ids2.txt', 'r') as f:
         pdb_ids = f.read().splitlines()
     for pdb_id in pdb_ids:
         yield pdb_id
@@ -76,26 +85,43 @@ def get_reference_structure(pdb_id, output_dir='pdb_files'):
     else:
         base_url = "https://files.rcsb.org/download"
         pdb_url = f"{base_url}/{pdb_id}.pdb"
-        response = requests.get(pdb_url, stream=True)
-        response.raise_for_status()
-        with open(path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)    
+        try:
+            response = requests.get(pdb_url, stream=True)
+            response.raise_for_status()
+            with open(path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                print(f"PDB ID {pdb_id} not found on RCSB. Skipping...")
+                return None
+            else:
+                raise e
     return gemmi.read_structure(path)
 
 def residue_density_map_generator(train_or_test):
     pdb_ids = pdb_id_generator(train_or_test)
     for pdb_id in pdb_ids:
-        mtz = gemmi.read_mtz_file(os.path.join('modelcraft_outputs', pdb_id, 'modelcraft.mtz'))
+        mtz_path = os.path.join('modelcraft_outputs', pdb_id, 'modelcraft.mtz')
+        cif_path = os.path.join('modelcraft_outputs', f"{pdb_id}", "modelcraft.cif")
+        try:
+            ref_structure = get_reference_structure(pdb_id)
+        except:
+            continue
+
+        if (not os.path.exists(mtz_path) 
+            or not os.path.exists(cif_path)
+            or not ref_structure):
+            continue
+
+        model_structure = gemmi.read_structure(cif_path)
+        if not model_structure: continue
+        mtz = gemmi.read_mtz_file(mtz_path)
         density_maps = [mtz.transform_f_phi_to_map(amplitude, phase) for amplitude, phase in MAPS]
 
-        for density_map in density_maps:
-            density_map.normalize()
+        # for density_map in density_maps:
+        #     density_map.normalize()
 
-        cif_path = os.path.join('modelcraft_outputs', f"{pdb_id}", "modelcraft.cif")
-        model_structure = gemmi.read_structure(cif_path)
-
-        ref_structure = get_reference_structure(pdb_id)
         neighbor_search = gemmi.NeighborSearch(ref_structure[0], ref_structure.cell, max_radius=5)
         for chain_idx, chain in enumerate(ref_structure[0]):
             for res_idx, res in enumerate(chain):
@@ -114,13 +140,13 @@ def residue_density_map_generator(train_or_test):
                     all_map_values.append(map_values)
 
                 model_CA = residue.find_atom("CA", "\0")
-                ref_CA = neighbor_search.find_nearest_atom(model_CA.pos, radius=5)
+                # ref_CA = neighbor_search.find_nearest_atom(model_CA.pos, radius=5)
+                ref_CA = neighbor_search.find_nearest_atom(model_CA.pos)
                 if not ref_CA:
                     continue
                 model_CA_pos = standard_position(model_CA.pos, model_structure.cell)
-                ref_CA_pos = standard_position(ref_CA.pos, ref_structure.cell)
+                ref_CA_pos = standard_position(ref_CA.pos(), ref_structure.cell)
                 model_to_ref = model_CA_pos - ref_CA_pos
-
                 yield np.concatenate(all_map_values, axis=-1), np.array([model_to_ref.length()])
 
 def standard_position(position, unit_cell):
@@ -138,7 +164,8 @@ def create_model():
         "strides": 1,
     }
 
-    filter_list = [32, 64, 128]
+    filter_list = [4 * 2**num_filters for num_filters in range(int(math.log(N_GRID, 2)))]
+    
     for filters in filter_list:
         x = tf.keras.layers.Conv3D(filters, **_downsampling_args)(x)
         x = tf.keras.layers.BatchNormalization()(x)
@@ -146,11 +173,13 @@ def create_model():
         x = tf.keras.layers.MaxPool3D(2)(x)
 
     x = tf.keras.layers.Flatten()(x)
-    x = tf.keras.layers.Dense(128)(x)
-    x = tf.keras.layers.Dense(64)(x)
-    x = tf.keras.layers.Dense(32)(x)
-    x = tf.keras.layers.Dense(16)(x)
-    x = tf.keras.layers.Dense(8)(x)
+    for filter in reversed(filter_list):
+        x = tf.keras.layers.Dense(filter, activation='relu')(x)
+    # x = tf.keras.layers.Dense(128)(x)
+    # x = tf.keras.layers.Dense(64)(x)
+    # x = tf.keras.layers.Dense(32)(x)
+    # x = tf.keras.layers.Dense(16)(x)
+    # x = tf.keras.layers.Dense(8)(x)
     output = tf.keras.layers.Dense(1)(x)
     return tf.keras.Model(inputs=inputs, outputs=output)
 
@@ -179,7 +208,7 @@ def train():
     model = create_model()
     model.summary()
 
-    model.compile(optimizer=tf.optimizers.Adam(learning_rate=1e-4), loss="mse",  metrics=['mse'])
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-6), loss="mse",  metrics=['mse'])
 
     logger = tf.keras.callbacks.CSVLogger(f"train_{name}.csv", append=True)
     reduce_lr_on_plat = tf.keras.callbacks.ReduceLROnPlateau(
@@ -233,17 +262,17 @@ def train_test_split(train_proportion=0.8):
 
     random.shuffle(pdb_ids)
     num_train = int(len(pdb_ids) * train_proportion)
-    if num_train == 0:
-        num_train = 1
-    elif num_train == len(pdb_ids):
-        num_train = len(pdb_ids) - 1
+    # if num_train == 0:
+    #     num_train = 1
+    # elif num_train == len(pdb_ids):
+    #     num_train = len(pdb_ids) - 1
 
     train_ids = pdb_ids[:num_train]
     test_ids = pdb_ids[num_train:]
 
     for train_or_test, pdb_ids in [("train", train_ids), ("test", test_ids)]:
-        for pdb_id in pdb_ids:
-            with open(f'{train_or_test}_pdb_ids.txt', 'w') as file:
+        with open(f'{train_or_test}_pdb_ids2.txt', 'w') as file:
+            for pdb_id in pdb_ids:
                 file.write(f"{pdb_id}\n")
 
 def main():
